@@ -16,5 +16,5 @@ jobs:
         wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh |
             bash -s -- --batch
         conda env create -f env-dev.yml
-        conda run --name aizynthfinder poetry install
-        conda run --name aizynthfinder inv full-tests
+        conda run --name aizynth-dev poetry install
+        conda run --name aizynth-dev inv full-tests

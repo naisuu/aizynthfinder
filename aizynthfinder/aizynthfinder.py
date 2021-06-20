@@ -2,6 +2,8 @@
 """
 from __future__ import annotations
 import time
+import importlib
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from deprecated import deprecated
@@ -10,12 +12,23 @@ from tqdm import tqdm
 # This must be imported first to setup logging for rdkit, tensorflow etc
 from aizynthfinder.utils.logging import logger
 from aizynthfinder.context.config import Configuration
-from aizynthfinder.mcts.mcts import SearchTree
+from aizynthfinder.mcts.mcts import SearchTree as MctsSearchTree
+from aizynthfinder.reactiontree import ReactionTreeFromExpansion
 from aizynthfinder.analysis import TreeAnalysis, RouteCollection
-from aizynthfinder.chem import Molecule
+from aizynthfinder.chem import Molecule, TreeMolecule, FixedRetroReaction
+from aizynthfinder.utils.trees import AndOrSearchTreeBase
 
 if TYPE_CHECKING:
-    from aizynthfinder.utils.type_utils import StrDict, Optional
+    from aizynthfinder.utils.type_utils import (
+        StrDict,
+        Optional,
+        Union,
+        Callable,
+        List,
+        Tuple,
+        Dict,
+    )
+    from aizynthfinder.chem import RetroReaction
 
 
 class AiZynthFinder:
@@ -55,7 +68,7 @@ class AiZynthFinder:
         self.filter_policy = self.config.filter_policy
         self.stock = self.config.stock
         self.scorers = self.config.scorers
-        self.tree: Optional[SearchTree] = None
+        self.tree: Optional[Union[MctsSearchTree, AndOrSearchTreeBase]] = None
         self._target_mol: Optional[Molecule] = None
         self.search_stats: StrDict = dict()
         self.routes = RouteCollection([])
@@ -103,7 +116,14 @@ class AiZynthFinder:
         """Extracts tree statistics as a dictionary"""
         if not self.analysis:
             return {}
-        stats = {"target": self.target_smiles, "search_time": self.search_stats["time"]}
+        stats = {
+            "target": self.target_smiles,
+            "search_time": self.search_stats["time"],
+            "first_solution_time": self.search_stats.get("first_solution_time", 0),
+            "first_solution_iteration": self.search_stats.get(
+                "first_solution_iteration", 0
+            ),
+        }
         stats.update(self.analysis.tree_statistics())
         return stats
 
@@ -121,8 +141,7 @@ class AiZynthFinder:
             self.stock.exclude(self.target_mol)
             self._logger.debug("Excluding the target compound from the stock")
 
-        self._logger.debug("Defining tree root: %s" % self.target_smiles)
-        self.tree = SearchTree(root_smiles=self.target_smiles, config=self.config)
+        self._setup_search_tree()
         self.analysis = None
         self.routes = RouteCollection([])
 
@@ -186,22 +205,23 @@ class AiZynthFinder:
         time_past = time.time() - time0
 
         if show_progress:
-            pbar = tqdm(total=self.config.iteration_limit)
+            pbar = tqdm(total=self.config.iteration_limit, leave=False)
 
         while time_past < self.config.time_limit and i <= self.config.iteration_limit:
             if show_progress:
                 pbar.update(1)
             self.search_stats["iterations"] += 1
 
-            leaf = self.tree.select_leaf()
-            leaf.expand()
-            while not leaf.is_terminal():
-                child = leaf.promising_child()
-                if child:
-                    child.expand()
-                    leaf = child
-            self.tree.backpropagate(leaf, leaf.state.score)
-            if self.config.return_first and leaf.state.is_solved:
+            try:
+                is_solved = self.tree.one_iteration()
+            except StopIteration:
+                break
+
+            if is_solved and "first_solution_time" not in self.search_stats:
+                self.search_stats["first_solution_time"] = time.time() - time0
+                self.search_stats["first_solution_iteration"] = i
+
+            if self.config.return_first and is_solved:
                 self._logger.debug("Found first solved route")
                 self.search_stats["returned_first"] = True
                 break
@@ -210,6 +230,7 @@ class AiZynthFinder:
 
         if show_progress:
             pbar.close()
+        time_past = time.time() - time0
         self._logger.debug("Search completed")
         self.search_stats["time"] = time_past
         return time_past
@@ -244,3 +265,100 @@ class AiZynthFinder:
         if self.filter_policy.selection:
             dict_["filter"] = self.filter_policy.selection
         return dict_
+
+    def _setup_search_tree(self):
+        self._logger.debug("Defining tree root: %s" % self.target_smiles)
+        if self.config.search_algorithm.lower() == "mcts":
+            self.tree = MctsSearchTree(
+                root_smiles=self.target_smiles, config=self.config
+            )
+        else:
+            module_name, cls_name = self.config.search_algorithm.rsplit(".", maxsplit=1)
+            try:
+                module_obj = importlib.import_module(module_name)
+            except ImportError:
+                raise ValueError(f"Could not import module {module_name}")
+
+            if not hasattr(module_obj, cls_name):
+                raise ValueError(f"Could not identify class {cls_name} in module")
+
+            self.tree: AndOrSearchTreeBase = getattr(module_obj, cls_name)(
+                root_smiles=self.target_smiles, config=self.config
+            )
+
+
+class AiZynthExpander:
+    """
+    Public API to the AiZynthFinder expansion and filter policies
+
+    If instantiated with the path to a yaml file or dictionary of settings
+    the stocks and policy networks are loaded directly.
+    Otherwise, the user is responsible for loading them prior to
+    executing the tree search.
+
+    :ivar config: the configuration of the search
+    :ivar expansion_policy: the expansion policy model
+    :ivar filter_policy: the filter policy model
+
+    :param configfile: the path to yaml file with configuration (has priority over configdict), defaults to None
+    :param configdict: the config as a dictionary source, defaults to None
+    """
+
+    def __init__(self, configfile: str = None, configdict: StrDict = None) -> None:
+        self._logger = logger()
+
+        if configfile:
+            self.config = Configuration.from_file(configfile)
+        elif configdict:
+            self.config = Configuration.from_dict(configdict)
+        else:
+            self.config = Configuration()
+
+        self.expansion_policy = self.config.expansion_policy
+        self.filter_policy = self.config.filter_policy
+
+    def do_expansion(
+        self,
+        smiles: str,
+        return_n: int = 5,
+        filter_func: Callable[[RetroReaction], bool] = None,
+    ) -> List[Tuple[FixedRetroReaction, ...]]:
+        """
+        Do the expansion of the given molecule returning a list of
+        reaction tuples. Each tuple in the list contains reactions
+        producing the same reactants. Hence, nested structure of the
+        return value is way to group reactions.
+
+        If filter policy is setup, the probability of the reactions are
+        added as metadata to the reaction.
+
+        The additional filter functions makes it possible to do customized
+        filtering. The callable should take as only argument a `RetroReaction`
+        object and return True if the reaction can be kept or False if it should
+        be removed.
+
+        :param smiles: the SMILES string of the target molecule
+        :param return_n: the length of the return list
+        :param filter_func: an additional filter function
+        :return: the grouped reactions
+        """
+
+        mol = TreeMolecule(parent=None, smiles=smiles)
+        actions, _ = self.expansion_policy.get_actions([mol])
+        results: Dict[Tuple[str, ...], List[FixedRetroReaction]] = defaultdict(list)
+        for action in actions:
+            reactants = action.apply()
+            if not reactants:
+                continue
+            if filter_func and not filter_func(action):
+                continue
+            if self.filter_policy.selection:
+                _, feasibility_prob = self.filter_policy.feasibility(action)
+                action.metadata["feasibility"] = float(feasibility_prob)
+            action.metadata["expansion_rank"] = len(results) + 1
+            unique_key = tuple(sorted(mol.inchi_key for mol in reactants[0]))
+            if unique_key not in results and len(results) >= return_n:
+                continue
+            rxn = next(ReactionTreeFromExpansion(action).tree.reactions())  # type: ignore
+            results[unique_key].append(rxn)
+        return [tuple(reactions) for reactions in results.values()]

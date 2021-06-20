@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## Version 2.6.0 - 2020-06-11 (2020-05-03)
+
+### Features
+
+- Add `AiZynthExpander` class as public interface to single-step reactions
+- Route distance calculations and clustering is now dependent on package `route-distances`
+- Route distance calculations with ML model is now supported
+- Reaction tree objects now has property `is_branched`
+
+
+## Version 2.5.0 - 2020-06-11 (2020-03-30)
+
+### Features
+
+- Introduce an interface for search algorithm working on AND/OR trees
+- The progress bar is now removed upon completion of the tree search
+- Move `ReactionTree` class to a new module (this will not brake backwards compatibility)
+
+### Bug fixes
+
+- Fix for Github issue #28 for a training script
+
+### Trivial changes
+
+- `scikit-learn` is now imported before `tensorflow`, according to Github issue 30
+
 ## Version 2.4.0 - 2020-02-22 (2020-02-22)
 
 
